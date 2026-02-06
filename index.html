@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Compound Miter Unfold</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 16px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; }
+    label { display: block; font-size: 12px; color: #444; margin-bottom: 4px; }
+    input { width: 120px; padding: 8px; border: 1px solid #ccc; border-radius: 8px; }
+    button { padding: 10px 14px; border: 0; border-radius: 10px; cursor: pointer; }
+    #status { color: #666; font-size: 12px; margin-top: 10px; }
+    #img { max-width: 100%; height: auto; border: 1px solid #eee; border-radius: 12px; margin-top: 12px; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/pyodide/v0.26.2/full/pyodide.js"></script>
+</head>
+<body>
+  <h2>複合勾配留め 切り墨</h2>
+
+  <div class="row card">
+    <div>
+      <label>材幅(mm)</label>
+      <input id="w" type="number" value="105" step="1" />
+    </div>
+    <div>
+      <label>材せい(mm)</label>
+      <input id="h" type="number" value="180" step="1" />
+    </div>
+    <div>
+      <label>水平方向勾配</label>
+      <input id="mh" type="number" value="0.500000" step="0.000001" />
+    </div>
+    <div>
+      <label>垂直方向勾配</label>
+      <input id="mv" type="number" value="0.500000" step="0.000001" />
+    </div>
+    <div>
+      <label>表示幅(mm)</label>
+      <input id="span" type="number" value="500" step="10" />
+    </div>
+    <div>
+      <button id="run" style="background:#111;color:#fff;">描画</button>
+    </div>
+  </div>
+
+  <div id="status">Initializing… (first run takes a bit)</div>
+  <img id="img" alt="plot" />
+
+<script>
+let pyodide = null;
+
+const PY_CODE = [
+"import io, base64",
+"import numpy as np",
+"import matplotlib",
+"matplotlib.use('agg')",
+"import matplotlib.pyplot as plt",
+"from mpl_toolkits.mplot3d import Axes3D  # noqa: F401",
+"",
+"# ----------------------------",
+"# Rotations",
+"# ----------------------------",
+"def Rz(a: float) -> np.ndarray:",
+"    ca, sa = np.cos(a), np.sin(a)",
+"    return np.array([[ca, -sa, 0.0],",
+"                     [sa,  ca, 0.0],",
+"                     [0.0, 0.0, 1.0]], dtype=float)",
+"",
+"def R_axis(axis, theta: float) -> np.ndarray:",
+"    axis = np.asarray(axis, dtype=float)",
+"    n = np.linalg.norm(axis)",
+"    if n < 1e-12:",
+"        return np.eye(3)",
+"    k = axis / n",
+"    kx, ky, kz = k",
+"    K = np.array([[0.0, -kz,  ky],",
+"                  [kz,  0.0, -kx],",
+"                  [-ky, kx,  0.0]], dtype=float)",
+"    I = np.eye(3)",
+"    c = np.cos(theta); s = np.sin(theta)",
+"    return I*c + (1.0-c)*np.outer(k,k) + s*K",
+"",
+"# ----------------------------",
+"# Prism + edges",
+"# ----------------------------",
+"def build_prism_vertices(w: float, h: float, L: float = 2000.0) -> np.ndarray:",
+"    y = w/2.0",
+"    z = h/2.0",
+"    x0 = -L/2.0",
+"    x1 =  L/2.0",
+"    verts = []",
+"    for x in (x0, x1):",
+"        for sy in (-1, 1):",
+"            for sz in (-1, 1):",
+"                verts.append([x, sy*y, sz*z])",
+"    return np.array(verts, dtype=float)",
+"",
+"BOX_EDGES = [",
+"    (0, 1), (0, 2), (1, 3), (2, 3),",
+"    (4, 5), (4, 6), (5, 7), (6, 7),",
+"    (0, 4), (1, 5), (2, 6), (3, 7),",
+"]",
+"",
+"def plane_eval(n, d, p) -> float:",
+"    return float(np.dot(n, p) - d)",
+"",
+"def intersect_segment_plane(p1, p2, n, d, eps: float = 1e-9):",
+"    f1 = plane_eval(n, d, p1)",
+"    f2 = plane_eval(n, d, p2)",
+"    if abs(f1) < eps and abs(f2) < eps:",
+"        return None",
+"    if abs(f1) < eps:",
+"        return p1.copy()",
+"    if abs(f2) < eps:",
+"        return p2.copy()",
+"    if f1 * f2 > 0:",
+"        return None",
+"    t = f1 / (f1 - f2)",
+"    return p1 + t * (p2 - p1)",
+"",
+"def unique_points(points, tol: float = 1e-6) -> np.ndarray:",
+"    uniq = []",
+"    for p in points:",
+"        if p is None:",
+"            continue",
+"        if all(np.linalg.norm(p - q) >= tol for q in uniq):",
+"            uniq.append(p)",
+"    return np.array(uniq, dtype=float)",
+"",
+"def plane_basis(n: np.ndarray):",
+"    n = n / np.linalg.norm(n)",
+"    a = np.array([0.0,0.0,1.0])",
+"    if abs(np.dot(a,n)) > 0.9:",
+"        a = np.array([0.0,1.0,0.0])",
+"    e1 = np.cross(n,a); e1 /= np.linalg.norm(e1)",
+"    e2 = np.cross(n,e1); e2 /= np.linalg.norm(e2)",
+"    return e1, e2",
+"",
+"def order_polygon(points: np.ndarray, n: np.ndarray) -> np.ndarray:",
+"    if len(points) < 3:",
+"        return points",
+"    c = points.mean(axis=0)",
+"    e1, e2 = plane_basis(n)",
+"    uv = np.stack([np.dot(points - c, e1), np.dot(points - c, e2)], axis=1)",
+"    ang = np.arctan2(uv[:,1], uv[:,0])",
+"    return points[np.argsort(ang)]",
+"",
+"# ----------------------------",
+"# Faces (for unfold)",
+"# ----------------------------",
+"def face_of_segment_by_endpoints(a_l: np.ndarray, b_l: np.ndarray, w: float, h: float) -> str:",
+"    yw, zh = w/2.0, h/2.0",
+"    scores = {",
+"        'RIGHT': abs(a_l[1]-yw) + abs(b_l[1]-yw),",
+"        'LEFT':  abs(a_l[1]+yw) + abs(b_l[1]+yw),",
+"        'TOP':   abs(a_l[2]-zh) + abs(b_l[2]-zh),",
+"        'BOTTOM':abs(a_l[2]+zh) + abs(b_l[2]+zh),",
+"    }",
+"    return min(scores, key=scores.get)",
+"",
+"def to2d(face: str, p_local: np.ndarray) -> np.ndarray:",
+"    x,y,z = p_local",
+"    if face in ('RIGHT','LEFT'):",
+"        return np.array([x,z], dtype=float)",
+"    if face in ('TOP','BOTTOM'):",
+"        return np.array([x,y], dtype=float)",
+"    raise ValueError(face)",
+"",
+"def select_main_segment(segments_2d):",
+"    if not segments_2d:",
+"        return None",
+"    best = None",
+"    best_key = None",
+"    for a,b in segments_2d:",
+"        mid = 0.5*(a+b)",
+"        x0 = abs(mid[0])",
+"        length = float(np.linalg.norm(b-a))",
+"        key = (x0, -length)",
+"        if best_key is None or key < best_key:",
+"            best_key = key",
+"            best = (a,b)",
+"    return best",
+"",
+"def draw_face(ax, face: str, w: float, h: float, L: float, segments_2d, title: str, view_span: float):",
+"    ax.set_title(title)",
+"    ax.set_aspect('equal', adjustable='box')",
+"    ax.grid(False)",
+"",
+"    x0, x1 = -L/2.0, L/2.0",
+"    if face in ('RIGHT','LEFT'):",
+"        v0, v1 = -h/2.0, h/2.0",
+"        member_v = h",
+"        ax.set_xlabel('x')",
+"        ax.set_ylabel('z')",
+"    else:",
+"        v0, v1 = -w/2.0, w/2.0",
+"        member_v = w",
+"        ax.set_xlabel('x')",
+"        ax.set_ylabel('y')",
+"",
+"    # outline",
+"    rect = np.array([[x0,v0],[x1,v0],[x1,v1],[x0,v1],[x0,v0]])",
+"    ax.plot(rect[:,0], rect[:,1], linewidth=1, color='#777777')",
+"",
+"    # ink segments (orange)",
+"    for a,b in segments_2d:",
+"        ax.plot([a[0],b[0]],[a[1],b[1]], linewidth=3, color='orange')",
+"",
+"    main = select_main_segment(segments_2d)",
+"    if main is None:",
+"        ax.set_xlim(-250,250); ax.set_ylim(-250,250)",
+"        return",
+"",
+"    a,b = main",
+"    mid = 0.5*(a+b)",
+"    dx = abs(b[0]-a[0])",
+"    dv = abs(b[1]-a[1])",
+"",
+"    tol = 0.5",
+"    show_dx = dx > tol",
+"    show_dv = (dv > tol) and (abs(dv - member_v) >= tol)",
+"",
+"    vals = []",
+"    if show_dx: vals.append(f'{dx:.2f}')",
+"    if show_dv: vals.append(f'{dv:.2f}')",
+"",
+"    # zoom around ink center",
+"    half = view_span/2.0",
+"    ax.set_xlim(mid[0]-half, mid[0]+half)",
+"    ax.set_ylim(mid[1]-half, mid[1]+half)",
+"",
+"    # place dimension line + text UNDER the member (fixed position)",
+"    if vals:",
+"        pad = 32.0",
+"        x_text = mid[0]",
+"        y_text = v0 - pad",
+"",
+"        # --- draw dimension line for dx (if shown) ---",
+"        if show_dx:",
+"            xA = min(a[0], b[0])",
+"            xB = max(a[0], b[0])",
+"            yD = v0 - 12.0  # dimension line level under the member",
+"            # extension lines",
+"            ax.plot([xA, xA], [v0, yD], color='red', linewidth=1.2)",
+"            ax.plot([xB, xB], [v0, yD], color='red', linewidth=1.2)",
+"            # dimension line with arrows",
+"            ax.annotate('', xy=(xB, yD), xytext=(xA, yD),",
+"                        arrowprops=dict(arrowstyle='<->', color='red', lw=1.6))",
+"",
+"        # --- (optional) draw dimension line for dv (if shown) ---",
+"        # if you want dv dimension too, set this block on",
+"        # if show_dv:",
+"        #     yA = min(a[1], b[1])",
+"        #     yB = max(a[1], b[1])",
+"        #     xD = x0 + 20.0",
+"        #     ax.plot([xD, a[0]], [yA, yA], color='red', linewidth=1.2)",
+"        #     ax.plot([xD, a[0]], [yB, yB], color='red', linewidth=1.2)",
+"        #     ax.annotate('', xy=(xD, yB), xytext=(xD, yA),",
+"        #                 arrowprops=dict(arrowstyle='<->', color='red', lw=1.6))",
+"",
+"        # numeric text (same as before)",
+"        ax.text(x_text, y_text, ' / '.join(vals),",
+"                ha='center', va='top', fontsize=11, color='black',",
+"                bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='none', alpha=0.9))",
+"",
+"        # extend view a bit to show the dimension line",
+"        ylo, yhi = ax.get_ylim()",
+"        ax.set_ylim(ylo - 40.0, yhi)",
+
+"",
+"# ----------------------------",
+"# 3D + 2D section",
+"# ----------------------------",
+"def draw_3d(ax, VW: np.ndarray, P: np.ndarray, span: float):",
+"    ax.set_title('3D')",
+"    ax.grid(False)",
+"",
+"    # member edges",
+"    for i,j in BOX_EDGES:",
+"        a = VW[i]; b = VW[j]",
+"        ax.plot([a[0],b[0]],[a[1],b[1]],[a[2],b[2]], linewidth=1, color='#777777')",
+"",
+"    # cut plane x=0 (small patch around section)",
+"    if P is not None and len(P) >= 3:",
+"        y0,y1 = P[:,1].min(), P[:,1].max()",
+"        z0,z1 = P[:,2].min(), P[:,2].max()",
+"    else:",
+"        y0,y1 = VW[:,1].min(), VW[:,1].max()",
+"        z0,z1 = VW[:,2].min(), VW[:,2].max()",
+"    my = (y1-y0)*0.25 + 1e-6",
+"    mz = (z1-z0)*0.25 + 1e-6",
+"    y0 -= my; y1 += my",
+"    z0 -= mz; z1 += mz",
+"    X = np.array([[0.0,0.0],[0.0,0.0]])",
+"    Y = np.array([[y0,y1],[y0,y1]])",
+"    Z = np.array([[z0,z0],[z1,z1]])",
+"    ax.plot_surface(X, Y, Z, alpha=0.15, linewidth=0)",
+"",
+"    # section polygon",
+"    if P is not None and len(P) >= 3:",
+"        Pc = np.vstack([P, P[0]])",
+"        ax.plot(Pc[:,0], Pc[:,1], Pc[:,2], linewidth=3, color='orange')",
+"",
+"    # zoom around cut plane (x=0) with unified scale for X/Y (and Z)",
+"    half = span/2.0",
+"",
+"    # center Y,Z around section polygon center",
+"    if P is not None and len(P) >= 3:",
+"        cy = float(P[:,1].mean())",
+"        cz = float(P[:,2].mean())",
+"    else:",
+"        cy = 0.0",
+"        cz = 0.0",
+"",
+"    ax.set_xlim(-half, +half)",
+"    ax.set_ylim(cy - half, cy + half)",
+"    ax.set_zlim(cz - half, cz + half)",
+"    ax.set_xlabel('X')",
+"    ax.set_ylabel('Y')",
+"    ax.set_zlabel('Z')",
+"",
+"    # optional: stable camera",
+"    ax.view_init(elev=20, azim=-60)",
+
+"",
+"def draw_section_2d(ax, P: np.ndarray, n: np.ndarray):",
+"    ax.set_title('2D')",
+"    ax.set_aspect('equal', adjustable='box')",
+"    ax.grid(True)",
+"    if P is None or len(P) < 3:",
+"        ax.text(0.5,0.5,'NO SECTION', ha='center', va='center', transform=ax.transAxes)",
+"        return",
+"",
+"    # TRUE SHAPE for plane x=0: view along +X => plot (Y,Z)",
+"    yz = np.stack([P[:,1], P[:,2]], axis=1).astype(float)",
+"",
+"    # close polygon",
+"    yzc = np.vstack([yz, yz[0]])",
+"    ax.plot(yzc[:,0], yzc[:,1], linewidth=3, color='orange')",
+"    ax.fill(yz[:,0], yz[:,1], alpha=0.08)",
+"    ax.set_xlabel('Y (mm)')",
+"    ax.set_ylabel('Z (mm)')",
+"",
+"    # orientation (CCW?) for outward label offset",
+"    area2 = 0.0",
+"    for i in range(len(yz)):",
+"        x1, y1 = yz[i]",
+"        x2, y2 = yz[(i+1) % len(yz)]",
+"        area2 += x1*y2 - x2*y1",
+"    ccw = area2 > 0.0",
+"",
+"    # edge length labels (mm)",
+"    for i in range(len(yz)):",
+"        a = yz[i]",
+"        b = yz[(i+1) % len(yz)]",
+"        d = b - a",
+"        L = float(np.linalg.norm(d))",
+"        if L < 1e-9:",
+"            continue",
+"",
+"        mid = 0.5*(a+b)",
+"        if ccw:",
+"            n2 = np.array([ d[1], -d[0] ], dtype=float)  # outward for CCW",
+"        else:",
+"            n2 = np.array([ -d[1], d[0] ], dtype=float)  # outward for CW",
+"        n2n = float(np.linalg.norm(n2))",
+"        if n2n > 1e-12:",
+"            n2 = n2 / n2n",
+"",
+"        off = 8.0",
+"        ptxt = mid + off*n2",
+"        ax.text(ptxt[0], ptxt[1], f'{L:.2f}', ha='center', va='center', fontsize=10,",
+"                bbox=dict(boxstyle='round,pad=0.15', fc='white', ec='none', alpha=0.9))",
+"",
+"    # margins",
+"    ymin, zmin = float(yz[:,0].min()), float(yz[:,1].min())",
+"    ymax, zmax = float(yz[:,0].max()), float(yz[:,1].max())",
+"    dy = ymax - ymin",
+"    dz = zmax - zmin",
+"    m = 0.08*max(dy, dz) + 10.0",
+"    ax.set_xlim(ymin - m, ymax + m)",
+"    ax.set_ylim(zmin - m, zmax + m)",
+
+"",
+"# ----------------------------",
+"# Main render",
+"# ----------------------------",
+"def render_png_b64(w_mm: float, h_mm: float, mh: float, mv: float, view_span: float, L: float = 2000.0) -> str:",
+"    alpha = np.arctan(mh)",
+"    beta  = np.arctan(mv)",
+"",
+"    # cut plane: world x=0",
+"    plane_n = np.array([1.0,0.0,0.0], dtype=float)",
+"    plane_d = 0.0",
+"",
+"    V = build_prism_vertices(w_mm, h_mm, L)",
+"",
+"    # plumb: yaw then pitch about lateral axis = ẑ × u_yaw",
+"    R_yaw = Rz(alpha)",
+"    u_yaw = R_yaw @ np.array([1.0,0.0,0.0], dtype=float)",
+"    z_hat = np.array([0.0,0.0,1.0], dtype=float)",
+"    lateral_axis = np.cross(z_hat, u_yaw)",
+"    R_pitch = R_axis(lateral_axis, beta)",
+"    R = R_pitch @ R_yaw",
+"",
+"    VW = (R @ V.T).T",
+"",
+"    pts = []",
+"    for i,j in BOX_EDGES:",
+"        p = intersect_segment_plane(VW[i], VW[j], plane_n, plane_d)",
+"        if p is not None:",
+"            pts.append(p)",
+"",
+"    P = unique_points(pts, tol=1e-6)",
+"    P = order_polygon(P, plane_n)",
+"    if len(P) < 3:",
+"        raise RuntimeError('no intersection')",
+"",
+"    Pin_local = (R.T @ P.T).T",
+"",
+"    face_segments = {'TOP':[], 'BOTTOM':[], 'LEFT':[], 'RIGHT':[]}",
+"    for k in range(len(Pin_local)):",
+"        a_l = Pin_local[k]",
+"        b_l = Pin_local[(k+1) % len(Pin_local)]",
+"        face = face_of_segment_by_endpoints(a_l, b_l, w_mm, h_mm)",
+"        face_segments[face].append((to2d(face, a_l), to2d(face, b_l)))",
+"",
+"    # ---- layout: 2x2 unfold + (3D, section) ----",
+"    fig = plt.figure(figsize=(12, 12))",
+"    gs = fig.add_gridspec(3, 2, height_ratios=[1.0, 1.0, 1.2])",
+"",
+"    ax_top    = fig.add_subplot(gs[0,0])",
+"    ax_right  = fig.add_subplot(gs[0,1])",
+"    ax_left   = fig.add_subplot(gs[1,0])",
+"    ax_bottom = fig.add_subplot(gs[1,1])",
+"    ax_3d     = fig.add_subplot(gs[2,0], projection='3d')",
+"    ax_sec    = fig.add_subplot(gs[2,1])",
+"",
+"    ax_map = {'TOP':ax_top, 'RIGHT':ax_right, 'LEFT':ax_left, 'BOTTOM':ax_bottom}",
+"    titles = {'TOP':'TOP', 'RIGHT':'RIGHT', 'LEFT':'LEFT', 'BOTTOM':'BOTTOM'}",
+"    for face, ax in ax_map.items():",
+"        draw_face(ax, face, w_mm, h_mm, L, face_segments[face], titles[face], view_span)",
+"",
+"    draw_3d(ax_3d, VW, P, view_span)",
+"    draw_section_2d(ax_sec, P, plane_n)",
+"",
+"    fig.suptitle(f'UNFOLD: w={w_mm:.0f} h={h_mm:.0f}  mh={mh:.6f}  mv={mv:.6f}', y=0.98)",
+"    plt.tight_layout()",
+"",
+"    buf = io.BytesIO()",
+"    fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')",
+"    plt.close(fig)",
+"    buf.seek(0)",
+"    return base64.b64encode(buf.read()).decode('ascii')",
+].join("\n");
+function applyQueryParamsToInputs() {
+  const p = new URLSearchParams(location.search);
+  const keys = ["w","h","mh","mv","span"];
+  for (const k of keys) {
+    if (p.has(k)) document.getElementById(k).value = p.get(k);
+  }
+}
+
+function getNum(id) {
+  return Number(document.getElementById(id).value);
+}
+
+async function init() {
+  const status = document.getElementById("status");
+  status.textContent = "Loading Pyodide…";
+  pyodide = await loadPyodide();
+
+  status.textContent = "Loading numpy/matplotlib…";
+  await pyodide.loadPackage(["numpy", "matplotlib"]);
+
+  status.textContent = "Loading Python code…";
+  await pyodide.runPythonAsync(PY_CODE);
+
+  status.textContent = "Ready.";
+}
+
+async function draw() {
+  const status = document.getElementById("status");
+  const img = document.getElementById("img");
+  try {
+    status.textContent = "Rendering…";
+
+    const w = getNum("w");
+    const h = getNum("h");
+    let mh = getNum("mh");
+    let mv = getNum("mv");
+    const span = getNum("span");
+
+    // keep 6dp in the UI boxes
+    document.getElementById("mh").value = mh.toFixed(6);
+    document.getElementById("mv").value = mv.toFixed(6);
+
+    pyodide.globals.set("W_IN", w);
+    pyodide.globals.set("H_IN", h);
+    pyodide.globals.set("MH_IN", mh);
+    pyodide.globals.set("MV_IN", mv);
+    pyodide.globals.set("SPAN_IN", span);
+
+    const b64 = await pyodide.runPythonAsync(
+      "render_png_b64(W_IN, H_IN, MH_IN, MV_IN, SPAN_IN)"
+    );
+
+    img.src = "data:image/png;base64," + b64;
+    status.textContent = "Done.";
+  } catch (e) {
+    console.error(e);
+    status.textContent = "Error: " + e;
+  }
+}
+
+document.getElementById("run").addEventListener("click", draw);
+
+// 起動（URLパラメータを先に反映）
+applyQueryParamsToInputs();
+init().then(draw);
+
+</script>
+</body>
+</html>
