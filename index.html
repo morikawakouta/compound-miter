@@ -162,11 +162,16 @@ const PY_CODE = [
 "",
 "def to2d(face: str, p_local: np.ndarray) -> np.ndarray:",
 "    x,y,z = p_local",
-"    if face in ('RIGHT','LEFT'):",
-"        return np.array([x,z], dtype=float)",
-"    if face in ('TOP','BOTTOM'):",
-"        return np.array([x,y], dtype=float)",
+"    if face == 'TOP':",
+"        return np.array([ x,  y], dtype=float)",
+"    if face == 'RIGHT':",
+"        return np.array([ x,  z], dtype=float)",
+"    if face == 'BOTTOM':",
+"        return np.array([ x, -y], dtype=float)",
+"    if face == 'LEFT':",
+"        return np.array([ x, -z], dtype=float)",
 "    raise ValueError(face)",
+
 "",
 "def select_main_segment(segments_2d):",
 "    if not segments_2d:",
@@ -521,8 +526,6 @@ document.getElementById("run").addEventListener("click", draw);
 applyQueryParamsToInputs();
 init().then(draw);
 
-  
 </script>
 </body>
 </html>
-
